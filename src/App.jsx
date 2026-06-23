@@ -96,7 +96,30 @@ async function saveSpotifyPlaylist(userId, name, uris, token) {
   return pl;
 }
 
-// ── Claude API ────────────────────────────────────────────────────────────────
+// Replace tracks/name on a playlist we created earlier (re-save instead of duplicating).
+async function updateSpotifyPlaylist(playlistId, name, uris, token) {
+  const auth = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
+  const meta = await fetch(`https://api.spotify.com/v1/playlists/${playlistId}`, {
+    method: "PUT", headers: auth,
+    body: JSON.stringify({ name, description: "Built with Tae Tempo Crate Builder 🎧" }),
+  });
+  if (meta.status === 404) throw new Error("PLAYLIST_GONE");
+  if (meta.status === 401) throw new Error("TOKEN_EXPIRED");
+  if (!meta.ok) throw new Error(`Could not update playlist (Spotify ${meta.status})`);
+  // PUT replaces the whole tracklist (first 100); remaining batches appended.
+  const put = await fetch(`https://api.spotify.com/v1/playlists/${playlistId}/tracks`, {
+    method: "PUT", headers: auth, body: JSON.stringify({ uris: uris.slice(0, 100) }),
+  });
+  if (put.status === 404) throw new Error("PLAYLIST_GONE");
+  if (!put.ok) throw new Error(`Could not update tracks (Spotify ${put.status})`);
+  for (let i = 100; i < uris.length; i += 100) {
+    const add = await fetch(`https://api.spotify.com/v1/playlists/${playlistId}/tracks`, {
+      method: "POST", headers: auth, body: JSON.stringify({ uris: uris.slice(i, i + 100) }),
+    });
+    if (!add.ok) throw new Error(`Playlist updated but adding tracks failed (Spotify ${add.status})`);
+  }
+  return { id: playlistId };
+}
 async function callClaude(body, apiKey) {
   if (!apiKey) throw new Error("No Anthropic API key set — add it in Setup.");
   const headers = {
@@ -508,7 +531,10 @@ export default function App() {
       const trackMap = {}; all.forEach((t) => { trackMap[t.id] = t; });
       const infoMap = {}; (analysis.tracks || []).forEach((t) => { infoMap[t.id] = t; });
 
-      const newCrates = VIBES.map((vibe) => {
+      const prev = crates;
+      const baseIds = new Set(VIBES.map((v) => v.id));
+
+      const rebuilt = VIBES.map((vibe) => {
         const ids = analysis.crates?.[vibe.id] || [];
         const songs = ids.filter((id) => trackMap[id]).map((id) => ({
           ...trackMap[id],
@@ -517,11 +543,30 @@ export default function App() {
           energy: infoMap[id]?.energy || 7,
           suggested: false,
         }));
-        return { id: vibe.id, vibe, songs, name: vibe.label, tags: [], notes: "", createdAt: Date.now() };
+        const old = prev.find((c) => c.id === vibe.id);
+        if (!old) {
+          return { id: vibe.id, vibe, songs, name: vibe.label, tags: [], notes: "", createdAt: Date.now() };
+        }
+        // Rebuild keeps user's metadata + any songs they added by hand (AI suggestions / searched tracks).
+        const freshIds = new Set(songs.map((s) => s.id));
+        const freshUris = new Set(songs.map((s) => s.uri).filter(Boolean));
+        const carried = old.songs.filter(
+          (s) => (s.suggested || s.manual) && !freshIds.has(s.id) && !(s.uri && freshUris.has(s.uri)),
+        );
+        return {
+          ...old, vibe, songs: [...songs, ...carried],
+          name: old.name || vibe.label, tags: old.tags || [], notes: old.notes || "",
+        };
       });
 
-      setCrates(newCrates);
-      persist(newCrates);
+      // Variations (user-made copies) are snapshots — keep them untouched.
+      const variations = prev.filter((c) => !baseIds.has(c.id));
+      const merged = [...rebuilt, ...variations];
+
+      setCrates(merged);
+      persist(merged);
+      const carriedCount = merged.reduce((a, c) => a + c.songs.filter((s) => s.suggested || s.manual).length, 0);
+      if (prev.length) setNotice(`Rebuilt your crates — kept names, tags, notes${variations.length ? `, ${variations.length} variation${variations.length > 1 ? "s" : ""}` : ""}${carriedCount ? `, and ${carriedCount} added track${carriedCount > 1 ? "s" : ""}` : ""}.`);
       setScreen("crates");
     } catch (e) {
       reportError(e);
@@ -554,6 +599,7 @@ export default function App() {
       id: `${crate.vibe.id}_${uid()}`,
       name: `${crateName(crate)} V2`,
       songs: crate.songs.map((s) => ({ ...s })),
+      spotifyPlaylistId: undefined, // variation saves to its own new playlist
       createdAt: Date.now(),
     };
     setCrates((prev) => {
@@ -729,8 +775,21 @@ export default function App() {
       if (!uris.length) { setError("Nothing to save yet — none of these tracks have a Spotify match."); return; }
       const skipped = crate.songs.length - uris.length;
       const name = `${crate.vibe.emoji} ${crateName(crate)} — Tae Tempo`;
-      await saveSpotifyPlaylist(user.id, name, uris, token);
-      setNotice(`✅ Saved "${name}" to Spotify with ${uris.length} tracks${skipped ? ` (${skipped} suggested track${skipped > 1 ? "s" : ""} couldn't be matched and were skipped).` : "."}`);
+      let pl, updated = false;
+      if (crate.spotifyPlaylistId) {
+        try {
+          pl = await updateSpotifyPlaylist(crate.spotifyPlaylistId, name, uris, token);
+          updated = true;
+        } catch (err) {
+          if (err.message === "PLAYLIST_GONE") pl = await saveSpotifyPlaylist(user.id, name, uris, token);
+          else throw err;
+        }
+      } else {
+        pl = await saveSpotifyPlaylist(user.id, name, uris, token);
+      }
+      updateCrate(crate.id, (c) => ({ ...c, spotifyPlaylistId: pl.id }));
+      const skipNote = skipped ? ` (${skipped} suggested track${skipped > 1 ? "s" : ""} without a Spotify match skipped).` : ".";
+      setNotice(`✅ ${updated ? "Updated" : "Saved"} "${name}" ${updated ? "in" : "to"} Spotify — ${uris.length} tracks${skipNote}`);
     } catch (e) {
       reportError(e);
     }
