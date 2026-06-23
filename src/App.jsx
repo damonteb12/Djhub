@@ -12,6 +12,10 @@ const VIBES = [
 const VIBE_BPM_DEFAULT = { hiphop: 95, rnb: 78, afrobeats: 105, pop: 122, classics: 96 };
 const MODEL = "claude-sonnet-4-20250514";
 
+// Offline showcase mode — seeds sample crates and skips Spotify/Claude auth.
+const DEMO = typeof window !== "undefined" &&
+  (window.location.hash.includes("demo") || (() => { try { return localStorage.getItem("demo_mode") === "1"; } catch { return false; } })());
+
 // ── Spotify PKCE ──────────────────────────────────────────────────────────────
 async function pkceChallenge() {
   const arr = crypto.getRandomValues(new Uint8Array(32));
@@ -280,6 +284,38 @@ function transitionTip(bpmDiff, compat) {
 
 const uid = () => Math.random().toString(36).slice(2, 9);
 
+// Sample crates for the offline demo build.
+function demoCrates() {
+  const vibe = (id) => VIBES.find((v) => v.id === id);
+  const t = (name, artist, bpm, key, energy, dur, extra = {}) => ({
+    id: "demo_" + uid(), name, artists: [{ name: artist }], duration_ms: dur,
+    bpm, key, energy, suggested: false, uri: "spotify:track:" + uid(), onSpotify: true, ...extra,
+  });
+  const crate = (id, name, songs, tags = [], notes = "") => ({ id, vibe: vibe(id), name, songs, tags, notes, createdAt: Date.now() });
+  return [
+    crate("hiphop", "Hip Hop / Trap", [
+      t("HUMBLE.", "Kendrick Lamar", 87, "6B", 8, 177000),
+      t("Rich Flex", "Drake & 21 Savage", 92, "5A", 7, 239000),
+      t("First Person Shooter", "Drake ft. J. Cole", 97, "8A", 8, 247000),
+      t("Type Shit", "Future, Metro Boomin, Travis Scott", 95, "8A", 8, 248000, { suggested: true, trending: true, year: 2024, reason: "Trending 2024 — key-compatible with the previous track" }),
+      t("Not Like Us", "Kendrick Lamar", 101, "1B", 9, 274000, { trending: true }),
+    ], ["Club Bangers"], "Save this for the peak of the night — drops hard after 1am."),
+    crate("rnb", "R&B / Soul", [
+      t("Best Part", "Daniel Caesar ft. H.E.R.", 67, "4A", 4, 209000),
+      t("Come Through and Chill", "Miguel", 70, "7A", 4, 296000),
+      t("Made For Me", "Muni Long", 72, "3A", 5, 188000, { suggested: true, trending: true, year: 2024, reason: "2024 R&B hit, sits in the same key family" }),
+      t("Snooze", "SZA", 73, "2A", 5, 201000, { trending: true }),
+      t("Good Days", "SZA", 75, "9B", 5, 279000),
+    ], ["Warm-up", "Cookout"], "Good for the early set / chill crowd."),
+    crate("afrobeats", "Afrobeats", [
+      t("Essence", "Wizkid ft. Tems", 106, "4B", 6, 248000),
+      t("Calm Down", "Rema", 107, "8B", 7, 239000, { trending: true }),
+      t("Unavailable", "Davido ft. Musa Keys", 110, "9A", 7, 232000),
+      t("Water", "Tyla", 114, "11B", 8, 200000, { trending: true }),
+    ]),
+  ];
+}
+
 // Greedy harmonic ordering: chain tracks that share compatible Camelot keys
 // while keeping BPM steps small. Starts from the lowest-BPM track (warm-up).
 function harmonicOrder(songs) {
@@ -393,7 +429,7 @@ const crateName = (cr) => cr.name || cr.vibe.label;
 
 // ── Main App ──────────────────────────────────────────────────────────────────
 export default function App() {
-  const [screen, setScreen] = useState("setup");
+  const [screen, setScreen] = useState(DEMO ? "crates" : "setup");
   const [token, setToken] = useState(() => localStorage.getItem("sp_token") || "");
   const [clientId, setClientId] = useState(() => localStorage.getItem("sp_client_id") || "");
   const [anthropicKey, setAnthropicKey] = useState(() => localStorage.getItem("anthropic_key") || "");
@@ -425,6 +461,17 @@ export default function App() {
   const activeCrate = crates.find((c) => c.id === activeId) || null;
 
   useEffect(() => {
+    if (DEMO) {
+      setUser({ display_name: "Tae Tempo (demo)", images: [] });
+      setCrates((prev) => {
+        if (prev.length) return prev;
+        const seeded = demoCrates();
+        persist(seeded);
+        return seeded;
+      });
+      setScreen("crates");
+      return;
+    }
     const params = new URLSearchParams(window.location.search);
     const code = params.get("code");
     if (code) {
@@ -434,6 +481,14 @@ export default function App() {
       initSession(token);
     }
   }, []);
+
+  // Block live API calls in the offline demo with a friendly note.
+  function demoBlock() {
+    if (!DEMO) return false;
+    setError(""); setLoadingId(null);
+    setNotice("🎬 Demo mode — connect your own Spotify + Anthropic key in the real app to enable AI suggestions, search, and saving. Everything else here is fully interactive!");
+    return true;
+  }
 
   function reportError(e) {
     const msg = e?.message || String(e);
@@ -513,6 +568,7 @@ export default function App() {
   }
 
   async function buildCrates() {
+    if (demoBlock()) return;
     if (!selected.length) { setError("Select at least one playlist"); return; }
     setScreen("building"); setError(""); setNotice("");
     try {
@@ -614,6 +670,7 @@ export default function App() {
 
   async function addMore(crateId, e) {
     e?.stopPropagation();
+    if (demoBlock()) return;
     setLoadingId(crateId); setError(""); setNotice("");
     try {
       const crate = crates.find((c) => c.id === crateId);
@@ -693,6 +750,7 @@ export default function App() {
 
   async function runSearch(e) {
     e?.preventDefault();
+    if (demoBlock()) return;
     const q = searchQuery.trim();
     if (!q) return;
     setSearching(true); setError("");
@@ -769,6 +827,7 @@ export default function App() {
 
   async function saveCrate(crate, e) {
     e?.stopPropagation();
+    if (demoBlock()) return;
     setError(""); setNotice("");
     try {
       const uris = crate.songs.filter((s) => s.uri).map((s) => s.uri);
