@@ -257,6 +257,62 @@ function transitionTip(bpmDiff, compat) {
 
 const uid = () => Math.random().toString(36).slice(2, 9);
 
+// Greedy harmonic ordering: chain tracks that share compatible Camelot keys
+// while keeping BPM steps small. Starts from the lowest-BPM track (warm-up).
+function harmonicOrder(songs) {
+  if (songs.length < 3) return [...songs];
+  const remaining = [...songs].sort((a, b) => (a.bpm || 90) - (b.bpm || 90));
+  const ordered = [remaining.shift()];
+  while (remaining.length) {
+    const cur = ordered[ordered.length - 1];
+    let bestIdx = 0, bestScore = -Infinity;
+    remaining.forEach((s, idx) => {
+      const bpmDiff = Math.abs((cur.bpm || 90) - (s.bpm || 90));
+      const compat = keyCompat(cur.key, s.key);
+      let score = -bpmDiff;
+      if (compat.ok === true) score += 12;
+      else if (compat.label === "close") score += 4;
+      else if (compat.label === "key clash") score -= 6;
+      if (score > bestScore) { bestScore = score; bestIdx = idx; }
+    });
+    ordered.push(remaining.splice(bestIdx, 1)[0]);
+  }
+  return ordered;
+}
+
+// Halftime / double-time flip for ambiguous tempos (e.g. trap 140 ↔ 70).
+const flipTempo = (bpm) => (bpm > 100 ? Math.round(bpm / 2) : Math.round(bpm * 2));
+
+// Plain-text cue sheet for reference while playing in Rekordbox.
+function buildSetSheet(crate) {
+  const v = crate.vibe;
+  const name = crate.name || v.label;
+  const bpms = crate.songs.map((s) => s.bpm || 90);
+  const head = [
+    `${v.emoji}  ${name.toUpperCase()} — TAE TEMPO`,
+    `${crate.songs.length} tracks · BPM ${bpms.length ? Math.min(...bpms) : v.bpmRange[0]}–${bpms.length ? Math.max(...bpms) : v.bpmRange[1]} · vibe ${v.label}`,
+    crate.tags?.length ? `tags: ${crate.tags.join(", ")}` : "",
+    crate.notes ? `notes: ${crate.notes}` : "",
+    "=".repeat(48),
+  ].filter(Boolean);
+  const lines = crate.songs.map((s, i) => {
+    const cues = getCues(s.duration_ms || 210000, s.bpm || 90);
+    const next = crate.songs[i + 1];
+    const num = String(i + 1).padStart(2, "0");
+    const row = [
+      `${num}  ${s.name} — ${s.artists.map((a) => a.name).join(", ")}`,
+      `    ${s.bpm} BPM · ${s.key} · in ${cues.cueIn} / out ${cues.cueOut}`,
+    ];
+    if (next) {
+      const dl = bpmDiffLabel(s.bpm, next.bpm);
+      const compat = keyCompat(s.key, next.key);
+      row.push(`    ↓ ${dl.label} · ${Math.abs((s.bpm || 90) - (next.bpm || 90))} BPM · ${compat.label}`);
+    }
+    return row.join("\n");
+  });
+  return [...head, "", ...lines, "", "Built with Tae Tempo Crate Builder 🎧"].join("\n");
+}
+
 // ── Styles ────────────────────────────────────────────────────────────────────
 const css = `
   @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700;900&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
@@ -336,6 +392,12 @@ export default function App() {
   const [tagDraft, setTagDraft] = useState("");
   const [dragId, setDragId] = useState(null);
   const [dragOverId, setDragOverId] = useState(null);
+  const [editCell, setEditCell] = useState(null);    // { songId, field } for inline BPM/key edit
+  const [cellDraft, setCellDraft] = useState("");
+  const [showSearch, setShowSearch] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState([]);
+  const [searching, setSearching] = useState(false);
 
   const activeCrate = crates.find((c) => c.id === activeId) || null;
 
@@ -549,14 +611,96 @@ export default function App() {
     }
   }
 
-  function reshuffle(crateId, e) {
+  // mode: "harmonic" (key-aware smart order) | "bpm" (simple tempo sort)
+  function reshuffle(crateId, mode, e) {
     e?.stopPropagation();
     setLoadingId(crateId);
     updateCrate(crateId, (c) => ({
       ...c,
-      songs: [...c.songs].sort((a, b) => (a.bpm || 90) - (b.bpm || 90)),
+      songs: mode === "bpm"
+        ? [...c.songs].sort((a, b) => (a.bpm || 90) - (b.bpm || 90))
+        : harmonicOrder(c.songs),
     }));
     setTimeout(() => setLoadingId(null), 500);
+  }
+
+  function updateSong(crateId, songId, patch) {
+    updateCrate(crateId, (c) => ({
+      ...c,
+      songs: c.songs.map((s) => (s.id === songId ? { ...s, ...patch } : s)),
+    }));
+  }
+
+  function commitCell(crateId) {
+    if (!editCell) return;
+    const { songId, field } = editCell;
+    if (field === "bpm") {
+      const n = parseInt(cellDraft, 10);
+      if (n >= 40 && n <= 220) updateSong(crateId, songId, { bpm: n });
+    } else if (field === "key") {
+      const k = cellDraft.trim().toUpperCase();
+      if (/^\d{1,2}[AB]$/.test(k)) updateSong(crateId, songId, { key: k });
+    }
+    setEditCell(null);
+    setCellDraft("");
+  }
+
+  async function runSearch(e) {
+    e?.preventDefault();
+    const q = searchQuery.trim();
+    if (!q) return;
+    setSearching(true); setError("");
+    try {
+      const d = await spGet(`/search?type=track&limit=8&q=${encodeURIComponent(q)}`, token);
+      setSearchResults(d.tracks?.items || []);
+    } catch (err) {
+      reportError(err);
+    }
+    setSearching(false);
+  }
+
+  function addSearchTrack(crateId, t) {
+    const crate = crates.find((c) => c.id === crateId);
+    if (crate.songs.some((s) => s.uri === t.uri)) { setNotice(`"${t.name}" is already in this crate.`); return; }
+    const song = {
+      id: t.id,
+      name: t.name,
+      artists: t.artists.map((a) => ({ name: a.name })),
+      duration_ms: t.duration_ms,
+      album: t.album,
+      uri: t.uri,
+      bpm: VIBE_BPM_DEFAULT[crate.vibe.id],
+      key: "8A",
+      energy: 7,
+      suggested: false,
+      onSpotify: true,
+      manual: true, // BPM/key are placeholders — user can correct inline
+    };
+    updateCrate(crateId, (c) => ({ ...c, songs: [...c.songs, song] }));
+    setNotice(`Added "${t.name}" — set its BPM/key by clicking those cells (defaults are estimates).`);
+  }
+
+  function exportSetSheet(crate, e) {
+    e?.stopPropagation();
+    if (!crate.songs.length) { setError("Nothing to export — this crate is empty."); return; }
+    const text = buildSetSheet(crate);
+    const fname = `${(crate.name || crate.vibe.label).replace(/[^\w]+/g, "_")}_set_sheet.txt`;
+    try {
+      const blob = new Blob([text], { type: "text/plain" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = fname;
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+    } catch { /* download not critical */ }
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text).then(
+        () => setNotice("📄 Set sheet downloaded and copied to clipboard."),
+        () => setNotice("📄 Set sheet downloaded."),
+      );
+    } else {
+      setNotice("📄 Set sheet downloaded.");
+    }
   }
 
   function removeSong(crateId, songId, e) {
@@ -597,6 +741,8 @@ export default function App() {
     setDetailView("list");
     setBpmFilter(null);
     setEditingName(false);
+    setShowSearch(false); setSearchResults([]); setSearchQuery("");
+    setEditCell(null);
     setError(""); setNotice("");
     setScreen("detail");
   }
@@ -871,11 +1017,20 @@ export default function App() {
                 <button className="btn-hover" onClick={(e) => addMore(cr.id, e)} disabled={loadingId === cr.id} style={F.ghost(v.color)}>
                   {loadingId === cr.id ? "⏳ Loading…" : "+ Need More Songs"}
                 </button>
-                <button className="btn-hover" onClick={(e) => reshuffle(cr.id, e)} disabled={loadingId === cr.id} style={F.ghost("#f59e0b")}>
-                  🔀 Reshuffle
+                <button className="btn-hover" onClick={() => { setShowSearch((s) => !s); setSearchResults([]); }} style={F.ghost("#06b6d4")}>
+                  🔎 Add Track
+                </button>
+                <button className="btn-hover" onClick={(e) => reshuffle(cr.id, "harmonic", e)} disabled={loadingId === cr.id} style={F.ghost("#f59e0b")} title="Smart order by key + BPM">
+                  🎚 Harmonic
+                </button>
+                <button className="btn-hover" onClick={(e) => reshuffle(cr.id, "bpm", e)} disabled={loadingId === cr.id} style={F.ghost("#f59e0b")} title="Simple tempo sort">
+                  🔀 BPM
                 </button>
                 <button className="btn-hover" onClick={() => duplicateCrate(cr)} style={F.ghost("#06b6d4")}>
                   ⧉ Variation
+                </button>
+                <button className="btn-hover" onClick={(e) => exportSetSheet(cr, e)} style={F.ghost("#b06ef3")}>
+                  📄 Set Sheet
                 </button>
                 <button className="btn-hover" onClick={(e) => saveCrate(cr, e)} style={F.btn("#22c55e")}>
                   💾 Save to Spotify
@@ -896,6 +1051,58 @@ export default function App() {
           {progress && loadingId === cr.id && (
             <div style={{ fontSize: 10, color: "#8a8ab0", marginBottom: 14, animation: "pulse 1.5s infinite" }}>{progress}</div>
           )}
+
+          {/* Search & add specific tracks */}
+          {showSearch && (
+            <div style={{ ...F.card("#06b6d433"), marginBottom: 18, padding: 16 }}>
+              <form onSubmit={runSearch} style={{ display: "flex", gap: 8 }}>
+                <input autoFocus style={{ ...F.input, flex: 1 }} placeholder="Search Spotify — song or artist…"
+                  value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} />
+                <button type="submit" className="btn-hover" style={F.btn("#06b6d4")}>{searching ? "…" : "Search"}</button>
+                <button type="button" className="btn-hover" onClick={() => { setShowSearch(false); setSearchResults([]); setSearchQuery(""); }} style={F.ghost("#444")}>Close</button>
+              </form>
+              {searchResults.length > 0 && (
+                <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 4 }}>
+                  {searchResults.map((t) => {
+                    const inCrate = cr.songs.some((s) => s.uri === t.uri);
+                    return (
+                      <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 8px", background: "#0a0a18", borderRadius: 6 }}>
+                        {t.album?.images?.[2]?.url || t.album?.images?.[0]?.url
+                          ? <img src={t.album.images[2]?.url || t.album.images[0].url} style={{ width: 32, height: 32, borderRadius: 4, flexShrink: 0 }} />
+                          : <div style={{ width: 32, height: 32, background: "#14142a", borderRadius: 4, flexShrink: 0 }} />}
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: 11, color: "#dce0f5", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.name}</div>
+                          <div style={{ fontSize: 9, color: "#555", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.artists.map((a) => a.name).join(", ")}</div>
+                        </div>
+                        <span style={{ fontSize: 9, color: "#444", flexShrink: 0 }}>{fmtMs(t.duration_ms)}</span>
+                        <button className="btn-hover" disabled={inCrate} onClick={() => addSearchTrack(cr.id, t)}
+                          style={{ ...F.btn(inCrate ? "#333" : "#22c55e", true), flexShrink: 0 }}>{inCrate ? "✓ added" : "+ add"}</button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Energy arc */}
+          {cr.songs.length > 1 && (() => {
+            const arc = cr.songs;
+            return (
+              <div style={{ marginBottom: 18 }}>
+                <div style={{ fontSize: 9, color: "#555", letterSpacing: 2, marginBottom: 6 }}>ENERGY ARC · warm-up → peak → cool-down</div>
+                <div style={{ display: "flex", alignItems: "flex-end", gap: 2, height: 44, background: "#0a0a18", borderRadius: 8, padding: "6px 8px", border: "1px solid #1e1e3a" }}>
+                  {arc.map((s, i) => {
+                    const e = Math.max(1, Math.min(10, s.energy || 5));
+                    return (
+                      <div key={s.id + "_e" + i} title={`${i + 1}. ${s.name} — energy ${e}/10`}
+                        style={{ flex: 1, height: `${e * 10}%`, minWidth: 2, background: v.color, opacity: 0.35 + e * 0.06, borderRadius: 2 }} />
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })()}
 
           {/* View toggle + BPM filter */}
           <div style={{ display: "flex", gap: 16, alignItems: "center", marginBottom: 16, flexWrap: "wrap" }}>
@@ -1002,7 +1209,7 @@ export default function App() {
                   const cues = getCues(song.duration_ms || 210000, song.bpm || VIBE_BPM_DEFAULT[v.id]);
                   const next = visible[i + 1];
                   const diff = next ? bpmDiffLabel(song.bpm, next.bpm) : null;
-                  const draggable = !filterActive;
+                  const draggable = !filterActive && !(editCell && editCell.songId === song.id);
                   return (
                     <div key={song.id + i}>
                       <div
@@ -1039,12 +1246,39 @@ export default function App() {
                         </div>
 
                         <div style={{ width: 52, textAlign: "center", flexShrink: 0 }}>
-                          <div style={{ fontSize: 15, fontWeight: 700, color: v.color, fontFamily: "'Barlow Condensed',sans-serif" }}>{song.bpm}</div>
-                          <div style={{ fontSize: 8, color: "#333" }}>BPM</div>
+                          {editCell?.songId === song.id && editCell.field === "bpm" ? (
+                            <div onClick={(e) => e.stopPropagation()} style={{ display: "flex", flexDirection: "column", gap: 3, alignItems: "center" }}>
+                              <input autoFocus type="number" value={cellDraft}
+                                onChange={(e) => setCellDraft(e.target.value)}
+                                onKeyDown={(e) => { if (e.key === "Enter") commitCell(cr.id); if (e.key === "Escape") { setEditCell(null); setCellDraft(""); } }}
+                                onBlur={() => commitCell(cr.id)}
+                                style={{ ...F.input, width: 50, padding: "2px 4px", fontSize: 13, textAlign: "center" }} />
+                              <button title="Halftime / double-time" onMouseDown={(e) => { e.preventDefault(); setCellDraft(String(flipTempo(parseInt(cellDraft || song.bpm, 10)))); }}
+                                style={{ ...F.btn("#2a2a4a", true), padding: "1px 5px", fontSize: 8 }}>½ / 2×</button>
+                            </div>
+                          ) : (
+                            <div onClick={(e) => { e.stopPropagation(); setEditCell({ songId: song.id, field: "bpm" }); setCellDraft(String(song.bpm)); }}
+                              title="Click to edit BPM" style={{ cursor: "pointer" }}>
+                              <div style={{ fontSize: 15, fontWeight: 700, color: v.color, fontFamily: "'Barlow Condensed',sans-serif" }}>{song.bpm}</div>
+                              <div style={{ fontSize: 8, color: "#333" }}>BPM ✎</div>
+                            </div>
+                          )}
                         </div>
                         <div style={{ width: 44, textAlign: "center", flexShrink: 0 }}>
-                          <div style={{ fontSize: 12, fontWeight: 600, color: "#b06ef3" }}>{song.key}</div>
-                          <div style={{ fontSize: 8, color: "#333" }}>KEY</div>
+                          {editCell?.songId === song.id && editCell.field === "key" ? (
+                            <input autoFocus value={cellDraft}
+                              onClick={(e) => e.stopPropagation()}
+                              onChange={(e) => setCellDraft(e.target.value)}
+                              onKeyDown={(e) => { if (e.key === "Enter") commitCell(cr.id); if (e.key === "Escape") { setEditCell(null); setCellDraft(""); } }}
+                              onBlur={() => commitCell(cr.id)}
+                              style={{ ...F.input, width: 42, padding: "2px 4px", fontSize: 12, textAlign: "center" }} />
+                          ) : (
+                            <div onClick={(e) => { e.stopPropagation(); setEditCell({ songId: song.id, field: "key" }); setCellDraft(song.key); }}
+                              title="Click to edit key (Camelot, e.g. 8A)" style={{ cursor: "pointer" }}>
+                              <div style={{ fontSize: 12, fontWeight: 600, color: "#b06ef3" }}>{song.key}</div>
+                              <div style={{ fontSize: 8, color: "#333" }}>KEY ✎</div>
+                            </div>
+                          )}
                         </div>
                         <div style={{ width: 52, textAlign: "center", flexShrink: 0 }}>
                           <div style={{ fontSize: 11, color: "#22c55e", fontWeight: 600 }}>{cues.cueIn}</div>
@@ -1159,7 +1393,8 @@ export default function App() {
                     style={{ ...F.btn(v.color, true), flex: 1, fontSize: 10 }}>
                     {loadingId === cr.id ? "…" : "+ Songs"}
                   </button>
-                  <button className="btn-hover" onClick={(e) => reshuffle(cr.id, e)} disabled={loadingId === cr.id} style={F.ghost("#f59e0b", true)}>🔀</button>
+                  <button className="btn-hover" title="Harmonic reshuffle" onClick={(e) => reshuffle(cr.id, "harmonic", e)} disabled={loadingId === cr.id} style={F.ghost("#f59e0b", true)}>🎚</button>
+                  <button className="btn-hover" title="Export set sheet" onClick={(e) => exportSetSheet(cr, e)} style={F.ghost("#b06ef3", true)}>📄</button>
                   <button className="btn-hover" onClick={(e) => saveCrate(cr, e)} style={F.ghost("#22c55e", true)}>💾</button>
                   <button className="btn-hover" title="Delete this crate"
                     onClick={(e) => { e.stopPropagation(); if (window.confirm(`Delete "${crateName(cr)}"? This can't be undone.`)) deleteCrate(cr.id); }}
