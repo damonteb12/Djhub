@@ -164,8 +164,14 @@ async function updateSpotifyPlaylist(playlistId, name, uris, token) {
   }
   return { id: playlistId };
 }
-async function callClaude(body, apiKey) {
-  if (!apiKey) throw new Error("No Anthropic API key set — add it in Setup.");
+// ── AI provider layer ─────────────────────────────────────────────────────────
+// cfg = { provider: "anthropic" | "nvidia", key, model }
+async function callAI(body, cfg) {
+  if (!cfg?.key) throw new Error(cfg?.provider === "nvidia" ? "No NVIDIA API key set — add it in Setup." : "No Anthropic API key set — add it in Setup.");
+  return cfg.provider === "nvidia" ? callNvidia(body, cfg) : callAnthropic(body, cfg.key);
+}
+
+async function callAnthropic(body, apiKey) {
   const headers = {
     "Content-Type": "application/json",
     "anthropic-dangerous-direct-browser-access": "true",
@@ -197,6 +203,35 @@ async function callClaude(body, apiKey) {
   return d.content.map((c) => c.text || "").join("");
 }
 
+// NVIDIA build (build.nvidia.com) — OpenAI-compatible endpoint, free tier, keys start with nvapi-.
+async function callNvidia(body, cfg) {
+  let res;
+  try {
+    res = await fetch("https://integrate.api.nvidia.com/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${cfg.key}` },
+      body: JSON.stringify({
+        model: cfg.model || "meta/llama-3.3-70b-instruct",
+        messages: body.messages,
+        max_tokens: body.max_tokens,
+        temperature: 0.4,
+      }),
+    });
+  } catch {
+    throw new Error("Couldn't reach NVIDIA. This is usually a browser CORS block — NVIDIA's API may not allow direct browser calls; see the note in Setup.");
+  }
+  if (!res.ok) {
+    let detail = "";
+    try { const e = await res.json(); detail = e?.detail || e?.error?.message || e?.message || ""; } catch { /* ignore */ }
+    if (res.status === 401 || res.status === 403) throw new Error("Invalid NVIDIA API key — check it in Setup (it should start with nvapi-).");
+    if (res.status === 429) throw new Error("NVIDIA rate limit reached — wait a moment and try again.");
+    if (res.status === 404) throw new Error(`Model "${cfg.model}" not found on NVIDIA — copy an exact model ID from build.nvidia.com/models.`);
+    throw new Error(`NVIDIA API error (${res.status})${detail ? ": " + detail : ""}`);
+  }
+  const d = await res.json();
+  return d.choices?.[0]?.message?.content || "";
+}
+
 // Robustly pull a JSON object out of a Claude text response.
 function parseClaudeJSON(text) {
   let clean = text.replace(/```json|```/g, "").trim();
@@ -213,11 +248,11 @@ function parseClaudeJSON(text) {
   }
 }
 
-async function claudeAnalyze(tracks, apiKey) {
+async function claudeAnalyze(tracks, cfg) {
   const sample = tracks.slice(0, 150);
   const list = sample.map((t) => `${t.id}||"${t.name.replace(/"/g, "'")}"|${t.artists.map((a) => a.name).join(" & ")}`).join("\n");
 
-  const text = await callClaude({
+  const text = await callAI({
     max_tokens: 8000,
     messages: [{
       role: "user",
@@ -241,15 +276,15 @@ Rules:
 - Order each crate for smooth DJ flow (similar BPM progression, compatible keys)
 - Every track ID must appear in exactly one crate`,
     }],
-  }, apiKey);
+  }, cfg);
 
   return parseClaudeJSON(text);
 }
 
-async function claudeSuggest(vibeLabel, songs, apiKey, count = 10) {
+async function claudeSuggest(vibeLabel, songs, cfg, count = 10) {
   const songList = songs.slice(0, 15).map((s) => `"${s.name}" by ${s.artists.map((a) => a.name).join(" & ")}`).join("\n");
 
-  const text = await callClaude({
+  const text = await callAI({
     max_tokens: 2000,
     messages: [{
       role: "user",
@@ -265,7 +300,7 @@ Return ONLY valid JSON (no markdown):
 - moods: 1–3 tags from EXACTLY: dark, bright, driving, vocal, instrumental, percussive, organic
 - energy: 1–10`,
     }],
-  }, apiKey);
+  }, cfg);
 
   return parseClaudeJSON(text).suggestions || [];
 }
@@ -476,6 +511,9 @@ export default function App() {
   const [token, setToken] = useState(() => localStorage.getItem("sp_token") || "");
   const [clientId, setClientId] = useState(() => localStorage.getItem("sp_client_id") || "");
   const [anthropicKey, setAnthropicKey] = useState(() => localStorage.getItem("anthropic_key") || "");
+  const [provider, setProvider] = useState(() => localStorage.getItem("ai_provider") || "nvidia");
+  const [nvidiaKey, setNvidiaKey] = useState(() => localStorage.getItem("nvidia_key") || "");
+  const [nvidiaModel, setNvidiaModel] = useState(() => localStorage.getItem("nvidia_model") || "meta/llama-3.3-70b-instruct");
   const [user, setUser] = useState(null);
   const [playlists, setPlaylists] = useState([]);
   const [selected, setSelected] = useState([]);
@@ -508,6 +546,10 @@ export default function App() {
 
   const activeCrate = crates.find((c) => c.id === activeId) || null;
 
+  const aiConfig = () => provider === "nvidia"
+    ? { provider: "nvidia", key: nvidiaKey.trim(), model: (nvidiaModel.trim() || "meta/llama-3.3-70b-instruct") }
+    : { provider: "anthropic", key: anthropicKey.trim(), model: MODEL };
+
   useEffect(() => {
     if (DEMO) {
       setUser({ display_name: "Tae Tempo (demo)", images: [] });
@@ -534,7 +576,7 @@ export default function App() {
   function demoBlock() {
     if (!DEMO) return false;
     setError(""); setLoadingId(null);
-    setNotice("🎬 Demo mode — connect your own Spotify + Anthropic key in the real app to enable AI suggestions, search, and saving. Everything else here is fully interactive!");
+    setNotice("🎬 Demo mode — connect your own Spotify + AI key (NVIDIA free tier or Anthropic) in the real app to enable AI suggestions, search, and saving. Everything else here is fully interactive!");
     return true;
   }
 
@@ -595,10 +637,19 @@ export default function App() {
 
   async function connectSpotify() {
     if (!clientId.trim()) { setError("Enter your Spotify Client ID"); return; }
-    if (!anthropicKey.trim()) { setError("Enter your Anthropic API Key"); return; }
-    if (!anthropicKey.trim().startsWith("sk-ant-")) { setError("That Anthropic key doesn't look right — it should start with sk-ant-"); return; }
+    if (provider === "nvidia") {
+      if (!nvidiaKey.trim()) { setError("Enter your NVIDIA API Key"); return; }
+      if (!nvidiaKey.trim().startsWith("nvapi-")) { setError("That NVIDIA key doesn't look right — it should start with nvapi-"); return; }
+      if (!nvidiaModel.trim()) { setError("Enter an NVIDIA model ID (e.g. meta/llama-3.3-70b-instruct)"); return; }
+    } else {
+      if (!anthropicKey.trim()) { setError("Enter your Anthropic API Key"); return; }
+      if (!anthropicKey.trim().startsWith("sk-ant-")) { setError("That Anthropic key doesn't look right — it should start with sk-ant-"); return; }
+    }
     localStorage.setItem("sp_client_id", clientId.trim());
+    localStorage.setItem("ai_provider", provider);
     localStorage.setItem("anthropic_key", anthropicKey.trim());
+    localStorage.setItem("nvidia_key", nvidiaKey.trim());
+    localStorage.setItem("nvidia_model", nvidiaModel.trim());
     setError("");
     const { verifier, challenge } = await pkceChallenge();
     sessionStorage.setItem("pkce_verifier", verifier);
@@ -630,7 +681,7 @@ export default function App() {
       }
       if (!all.length) { setError("Those playlists had no playable tracks."); setScreen("playlists"); return; }
       setProgress(`🤖  Claude is analyzing ${Math.min(all.length, 150)} tracks (BPM, key, vibe)…`);
-      const analysis = await claudeAnalyze(all, anthropicKey);
+      const analysis = await claudeAnalyze(all, aiConfig());
 
       const trackMap = {}; all.forEach((t) => { trackMap[t.id] = t; });
       const infoMap = {}; (analysis.tracks || []).forEach((t) => { infoMap[t.id] = t; });
@@ -724,7 +775,7 @@ export default function App() {
     try {
       const crate = crates.find((c) => c.id === crateId);
       setProgress("🤖  Asking Claude for fresh suggestions…");
-      const suggestions = await claudeSuggest(crate.vibe.label, crate.songs, anthropicKey);
+      const suggestions = await claudeSuggest(crate.vibe.label, crate.songs, aiConfig());
 
       // Try to resolve each suggestion to a real Spotify track so it can be saved.
       let matched = 0;
@@ -947,7 +998,8 @@ export default function App() {
     localStorage.removeItem("sp_token");
     localStorage.removeItem("dj_crates");
     localStorage.removeItem("anthropic_key");
-    setToken(""); setUser(null); setPlaylists([]); setCrates([]); setActiveId(null); setAnthropicKey("");
+    localStorage.removeItem("nvidia_key");
+    setToken(""); setUser(null); setPlaylists([]); setCrates([]); setActiveId(null); setAnthropicKey(""); setNvidiaKey("");
     setScreen("setup");
   }
 
@@ -1027,18 +1079,57 @@ export default function App() {
 
         <div style={{ ...F.card(), marginBottom: 16 }}>
           <div style={{ fontSize: 10, color: "#b06ef3", letterSpacing: 2, fontWeight: 600, marginBottom: 12 }}>
-            STEP 2 — ANTHROPIC API KEY
+            STEP 2 — AI PROVIDER
           </div>
-          <div style={{ fontSize: 11, color: "#666", lineHeight: 1.8, marginBottom: 12 }}>
-            Get a key at <a href="https://console.anthropic.com" target="_blank" rel="noreferrer" style={{ color: "#06b6d4" }}>console.anthropic.com</a> → API Keys → Create Key
+          <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+            <button onClick={() => setProvider("nvidia")}
+              style={{ ...F.btn(provider === "nvidia" ? "#22c55e" : "transparent", true), flex: 1, padding: "9px", border: `1px solid ${provider === "nvidia" ? "#22c55e" : "#1e1e3a"}`, color: provider === "nvidia" ? "#fff" : "#888" }}>
+              🟢 NVIDIA · free
+            </button>
+            <button onClick={() => setProvider("anthropic")}
+              style={{ ...F.btn(provider === "anthropic" ? "#b06ef3" : "transparent", true), flex: 1, padding: "9px", border: `1px solid ${provider === "anthropic" ? "#b06ef3" : "#1e1e3a"}`, color: provider === "anthropic" ? "#fff" : "#888" }}>
+              💜 Anthropic · Claude
+            </button>
           </div>
-          <input
-            style={F.input}
-            placeholder="sk-ant-..."
-            type="password"
-            value={anthropicKey}
-            onChange={(e) => setAnthropicKey(e.target.value)}
-          />
+
+          {provider === "nvidia" ? (
+            <>
+              <div style={{ fontSize: 11, color: "#666", lineHeight: 1.8, marginBottom: 10 }}>
+                Get a free key at <a href="https://build.nvidia.com" target="_blank" rel="noreferrer" style={{ color: "#06b6d4" }}>build.nvidia.com</a> → pick a model → <b>Get API Key</b>. Then paste a model ID from <a href="https://build.nvidia.com/models" target="_blank" rel="noreferrer" style={{ color: "#06b6d4" }}>build.nvidia.com/models</a> below.
+              </div>
+              <input
+                style={{ ...F.input, marginBottom: 10 }}
+                placeholder="nvapi-..."
+                type="password"
+                value={nvidiaKey}
+                onChange={(e) => setNvidiaKey(e.target.value)}
+              />
+              <div style={{ fontSize: 9, color: "#555", letterSpacing: 1, marginBottom: 6 }}>MODEL ID</div>
+              <input
+                style={F.input}
+                placeholder="meta/llama-3.3-70b-instruct"
+                value={nvidiaModel}
+                onChange={(e) => setNvidiaModel(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && connectSpotify()}
+              />
+              <div style={{ fontSize: 10, color: "#f59e0b", lineHeight: 1.7, marginTop: 12, background: "#1a1204", border: "1px solid #f59e0b33", borderRadius: 6, padding: "8px 10px" }}>
+                ⚠ Heads up: NVIDIA's API may block direct browser calls (CORS). If AI steps fail with a "couldn't reach NVIDIA" error, the key works but the call needs a small proxy — tell me and I'll add a Netlify function.
+              </div>
+            </>
+          ) : (
+            <>
+              <div style={{ fontSize: 11, color: "#666", lineHeight: 1.8, marginBottom: 12 }}>
+                Get a key at <a href="https://console.anthropic.com" target="_blank" rel="noreferrer" style={{ color: "#06b6d4" }}>console.anthropic.com</a> → API Keys → Create Key
+              </div>
+              <input
+                style={F.input}
+                placeholder="sk-ant-..."
+                type="password"
+                value={anthropicKey}
+                onChange={(e) => setAnthropicKey(e.target.value)}
+              />
+            </>
+          )}
         </div>
 
         <div style={{ ...F.card(), marginBottom: 16 }}>
