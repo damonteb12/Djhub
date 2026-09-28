@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 
 // ── Vibe Definitions ──────────────────────────────────────────────────────────
 const VIBES = [
@@ -15,6 +15,46 @@ const MODEL = "claude-sonnet-4-20250514";
 // Offline showcase mode — seeds sample crates and skips Spotify/Claude auth.
 const DEMO = typeof window !== "undefined" &&
   (window.location.hash.includes("demo") || (() => { try { return localStorage.getItem("demo_mode") === "1"; } catch { return false; } })());
+
+// Character/mood tags (inspired by DaJent) — assigned by Claude, shown as chips, filterable.
+const MOODS = ["dark", "bright", "driving", "vocal", "instrumental", "percussive", "organic"];
+const MOOD_COLOR = {
+  dark: "#7c6cf0", bright: "#f5c542", driving: "#ff4060", vocal: "#06b6d4",
+  instrumental: "#22c55e", percussive: "#f59e0b", organic: "#84cc16",
+};
+
+// Energy Map presets — target energy (1..10) as a function of set position x∈[0,1].
+const ENERGY_SHAPES = {
+  buildup:    { label: "Build-Up",     emoji: "📈", fn: (x) => 3 + x * 6 },
+  slowburn:   { label: "Slow Burn",    emoji: "🔥", fn: (x) => 9 - x * 5 },
+  peakvalley: { label: "Peak & Valley", emoji: "🎢", fn: (x) => 5.5 + 3.5 * Math.cos(x * 2 * Math.PI) },
+  driving:    { label: "Driving",      emoji: "🚀", fn: (x) => 8.2 - 0.6 * Math.cos(x * 4 * Math.PI) },
+  cooldown:   { label: "Cool-Down",    emoji: "🌙", fn: (x) => 7 - x * 4 },
+};
+const clampE = (v) => Math.max(1, Math.min(10, v));
+// Sample a shape into `n` control points (1..10).
+function sampleShape(fn, n = 8) {
+  return Array.from({ length: n }, (_, i) => Math.round(clampE(fn(n === 1 ? 0 : i / (n - 1))) * 10) / 10);
+}
+// Linear-interpolate a control-point array at x∈[0,1].
+function interpControls(controls, x) {
+  if (!controls.length) return 5;
+  const seg = x * (controls.length - 1);
+  const i = Math.floor(seg), f = seg - i;
+  if (i >= controls.length - 1) return controls[controls.length - 1];
+  return controls[i] * (1 - f) + controls[i + 1] * f;
+}
+// Reorder songs so their energy follows the target curve (highest energy → highest target slot).
+function arrangeToShape(songs, controls) {
+  const n = songs.length;
+  if (n < 2) return [...songs];
+  const target = (i) => interpControls(controls, i / (n - 1));
+  const slotsByTarget = [...Array(n).keys()].sort((a, b) => target(b) - target(a));
+  const songsByEnergy = [...songs].sort((a, b) => (b.energy || 5) - (a.energy || 5));
+  const result = new Array(n);
+  slotsByTarget.forEach((slotIdx, k) => { result[slotIdx] = songsByEnergy[k]; });
+  return result;
+}
 
 // ── Spotify PKCE ──────────────────────────────────────────────────────────────
 async function pkceChallenge() {
@@ -188,7 +228,7 @@ ${list}
 
 Return ONLY valid JSON (no markdown, no backticks):
 {
-  "tracks": [{"id":"...","bpm":95,"key":"8A","vibe":"hiphop","energy":7}],
+  "tracks": [{"id":"...","bpm":95,"key":"8A","vibe":"hiphop","energy":7,"moods":["dark","vocal"]}],
   "crates": {"hiphop":["id1"],"rnb":["id2"],"afrobeats":[],"pop":[],"classics":[]}
 }
 
@@ -197,6 +237,7 @@ Rules:
 - BPM: hiphop 85–105, rnb 65–90, afrobeats 95–115, pop 110–135, classics 80–110
 - key: Camelot notation e.g. "8A" "3B" "10B"
 - energy: 1–10
+- moods: 1–3 tags from EXACTLY this list describing the track's character: dark, bright, driving, vocal, instrumental, percussive, organic
 - Order each crate for smooth DJ flow (similar BPM progression, compatible keys)
 - Every track ID must appear in exactly one crate`,
     }],
@@ -220,7 +261,9 @@ ${songList || "(crate is empty — suggest staples for this vibe)"}
 Include 2024–2025 trending hits AND classic staples. For hip hop and R&B, include current chart-toppers.
 
 Return ONLY valid JSON (no markdown):
-{"suggestions":[{"title":"Song Name","artist":"Artist","bpm":95,"key":"8A","trending":true,"year":2024,"reason":"Flows smoothly from previous track"}]}`,
+{"suggestions":[{"title":"Song Name","artist":"Artist","bpm":95,"key":"8A","energy":7,"moods":["dark","vocal"],"trending":true,"year":2024,"reason":"Flows smoothly from previous track"}]}
+- moods: 1–3 tags from EXACTLY: dark, bright, driving, vocal, instrumental, percussive, organic
+- energy: 1–10`,
     }],
   }, apiKey);
 
@@ -294,24 +337,24 @@ function demoCrates() {
   const crate = (id, name, songs, tags = [], notes = "") => ({ id, vibe: vibe(id), name, songs, tags, notes, createdAt: Date.now() });
   return [
     crate("hiphop", "Hip Hop / Trap", [
-      t("HUMBLE.", "Kendrick Lamar", 87, "6B", 8, 177000),
-      t("Rich Flex", "Drake & 21 Savage", 92, "5A", 7, 239000),
-      t("First Person Shooter", "Drake ft. J. Cole", 97, "8A", 8, 247000),
-      t("Type Shit", "Future, Metro Boomin, Travis Scott", 95, "8A", 8, 248000, { suggested: true, trending: true, year: 2024, reason: "Trending 2024 — key-compatible with the previous track" }),
-      t("Not Like Us", "Kendrick Lamar", 101, "1B", 9, 274000, { trending: true }),
+      t("HUMBLE.", "Kendrick Lamar", 87, "6B", 8, 177000, { moods: ["dark", "percussive"] }),
+      t("Rich Flex", "Drake & 21 Savage", 92, "5A", 7, 239000, { moods: ["dark", "vocal"] }),
+      t("First Person Shooter", "Drake ft. J. Cole", 97, "8A", 8, 247000, { moods: ["vocal", "driving"] }),
+      t("Type Shit", "Future, Metro Boomin, Travis Scott", 95, "8A", 8, 248000, { suggested: true, trending: true, year: 2024, reason: "Trending 2024 — key-compatible with the previous track", moods: ["dark", "driving"] }),
+      t("Not Like Us", "Kendrick Lamar", 101, "1B", 9, 274000, { trending: true, moods: ["driving", "vocal"] }),
     ], ["Club Bangers"], "Save this for the peak of the night — drops hard after 1am."),
     crate("rnb", "R&B / Soul", [
-      t("Best Part", "Daniel Caesar ft. H.E.R.", 67, "4A", 4, 209000),
-      t("Come Through and Chill", "Miguel", 70, "7A", 4, 296000),
-      t("Made For Me", "Muni Long", 72, "3A", 5, 188000, { suggested: true, trending: true, year: 2024, reason: "2024 R&B hit, sits in the same key family" }),
-      t("Snooze", "SZA", 73, "2A", 5, 201000, { trending: true }),
-      t("Good Days", "SZA", 75, "9B", 5, 279000),
+      t("Best Part", "Daniel Caesar ft. H.E.R.", 67, "4A", 4, 209000, { moods: ["vocal", "organic"] }),
+      t("Come Through and Chill", "Miguel", 70, "7A", 4, 296000, { moods: ["vocal", "organic"] }),
+      t("Made For Me", "Muni Long", 72, "3A", 5, 188000, { suggested: true, trending: true, year: 2024, reason: "2024 R&B hit, sits in the same key family", moods: ["bright", "vocal"] }),
+      t("Snooze", "SZA", 73, "2A", 5, 201000, { trending: true, moods: ["dark", "vocal"] }),
+      t("Good Days", "SZA", 75, "9B", 5, 279000, { moods: ["bright", "vocal"] }),
     ], ["Warm-up", "Cookout"], "Good for the early set / chill crowd."),
     crate("afrobeats", "Afrobeats", [
-      t("Essence", "Wizkid ft. Tems", 106, "4B", 6, 248000),
-      t("Calm Down", "Rema", 107, "8B", 7, 239000, { trending: true }),
-      t("Unavailable", "Davido ft. Musa Keys", 110, "9A", 7, 232000),
-      t("Water", "Tyla", 114, "11B", 8, 200000, { trending: true }),
+      t("Essence", "Wizkid ft. Tems", 106, "4B", 6, 248000, { moods: ["organic", "vocal"] }),
+      t("Calm Down", "Rema", 107, "8B", 7, 239000, { trending: true, moods: ["bright", "vocal"] }),
+      t("Unavailable", "Davido ft. Musa Keys", 110, "9A", 7, 232000, { moods: ["driving", "percussive"] }),
+      t("Water", "Tyla", 114, "11B", 8, 200000, { trending: true, moods: ["bright", "driving"] }),
     ]),
   ];
 }
@@ -360,7 +403,7 @@ function buildSetSheet(crate) {
     const num = String(i + 1).padStart(2, "0");
     const row = [
       `${num}  ${s.name} — ${s.artists.map((a) => a.name).join(", ")}`,
-      `    ${s.bpm} BPM · ${s.key} · in ${cues.cueIn} / out ${cues.cueOut}`,
+      `    ${s.bpm} BPM · ${s.key} · E${s.energy || "?"} · in ${cues.cueIn} / out ${cues.cueOut}${s.moods?.length ? " · " + s.moods.join(", ") : ""}`,
     ];
     if (next) {
       const dl = bpmDiffLabel(s.bpm, next.bpm);
@@ -457,6 +500,11 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState([]);
   const [searching, setSearching] = useState(false);
+  const [moodFilter, setMoodFilter] = useState([]);           // active mood chips
+  const [energyTarget, setEnergyTarget] = useState(sampleShape(ENERGY_SHAPES.buildup.fn)); // draggable curve
+  const [energyShape, setEnergyShape] = useState("buildup");  // selected preset id | "custom"
+  const [dragPoint, setDragPoint] = useState(null);           // index of control point being dragged
+  const energyRef = useRef(null);
 
   const activeCrate = crates.find((c) => c.id === activeId) || null;
 
@@ -597,6 +645,7 @@ export default function App() {
           bpm: infoMap[id]?.bpm || VIBE_BPM_DEFAULT[vibe.id],
           key: infoMap[id]?.key || "8A",
           energy: infoMap[id]?.energy || 7,
+          moods: Array.isArray(infoMap[id]?.moods) ? infoMap[id].moods.filter((m) => MOODS.includes(m)) : [],
           suggested: false,
         }));
         const old = prev.find((c) => c.id === vibe.id);
@@ -697,7 +746,8 @@ export default function App() {
           artists: [{ name: s.artist }],
           duration_ms: sp?.duration_ms || 210000,
           album: sp?.album || null,
-          bpm: s.bpm, key: s.key, energy: 7,
+          bpm: s.bpm, key: s.key, energy: s.energy || 7,
+          moods: Array.isArray(s.moods) ? s.moods.filter((m) => MOODS.includes(m)) : [],
           trending: s.trending, year: s.year, reason: s.reason,
           suggested: true,
           uri: sp?.uri || null,
@@ -776,6 +826,7 @@ export default function App() {
       bpm: VIBE_BPM_DEFAULT[crate.vibe.id],
       key: "8A",
       energy: 7,
+      moods: [],
       suggested: false,
       onSpotify: true,
       manual: true, // BPM/key are placeholders — user can correct inline
@@ -858,11 +909,31 @@ export default function App() {
     setActiveId(crate.id);
     setDetailView("list");
     setBpmFilter(null);
+    setMoodFilter([]);
     setEditingName(false);
     setShowSearch(false); setSearchResults([]); setSearchQuery("");
     setEditCell(null);
+    if (crate.energyTarget?.length) { setEnergyTarget(crate.energyTarget); setEnergyShape(crate.energyShape || "custom"); }
+    else { setEnergyTarget(sampleShape(ENERGY_SHAPES.buildup.fn)); setEnergyShape("buildup"); }
+    setDragPoint(null);
     setError(""); setNotice("");
     setScreen("detail");
+  }
+
+  function pickShape(crateId, shapeId) {
+    const controls = sampleShape(ENERGY_SHAPES[shapeId].fn);
+    setEnergyTarget(controls);
+    setEnergyShape(shapeId);
+    updateCrate(crateId, (c) => ({ ...c, energyTarget: controls, energyShape: shapeId }));
+  }
+
+  function saveEnergyTarget(crateId, controls) {
+    updateCrate(crateId, (c) => ({ ...c, energyTarget: controls, energyShape: "custom" }));
+  }
+
+  function arrangeToEnergyMap(crateId) {
+    updateCrate(crateId, (c) => ({ ...c, songs: arrangeToShape(c.songs, energyTarget) }));
+    setNotice("🎢 Arranged the crate to follow your Energy Map.");
   }
 
   function addTag(crateId) {
@@ -1080,11 +1151,15 @@ export default function App() {
     const minBpm = bpms.length ? Math.min(...bpms) : v.bpmRange[0];
     const maxBpm = bpms.length ? Math.max(...bpms) : v.bpmRange[1];
     const filter = bpmFilter || { min: minBpm, max: maxBpm };
+    const availableMoods = MOODS.filter((m) => cr.songs.some((s) => s.moods?.includes(m)));
     const visible = cr.songs.filter((s) => {
       const b = s.bpm || VIBE_BPM_DEFAULT[v.id];
-      return b >= filter.min && b <= filter.max;
+      const bpmOk = b >= filter.min && b <= filter.max;
+      const moodOk = !moodFilter.length || (s.moods || []).some((m) => moodFilter.includes(m));
+      return bpmOk && moodOk;
     });
-    const filterActive = bpmFilter && (filter.min > minBpm || filter.max < maxBpm);
+    const bpmActive = bpmFilter && (filter.min > minBpm || filter.max < maxBpm);
+    const filterActive = bpmActive || moodFilter.length > 0;
 
     return (
       <div style={F.app}>
@@ -1203,20 +1278,63 @@ export default function App() {
             </div>
           )}
 
-          {/* Energy arc */}
+          {/* ── ENERGY MAP (draggable target curve, inspired by DaJent) ── */}
           {cr.songs.length > 1 && (() => {
-            const arc = cr.songs;
+            const N = energyTarget.length;
+            const P = 0.10;
+            const y01 = (val) => P + ((10 - clampE(val)) / 9) * (1 - 2 * P);
+            const tx = (i) => (N === 1 ? 0 : i / (N - 1)) * 100;
+            const targetPts = energyTarget.map((val, i) => `${tx(i)},${y01(val) * 100}`).join(" ");
+            const m = cr.songs.length;
+            const actualPts = cr.songs.map((s, j) => `${(j / (m - 1)) * 100},${y01(s.energy || 5) * 100}`).join(" ");
+            const onMove = (ev) => {
+              if (dragPoint == null || !energyRef.current) return;
+              const rect = energyRef.current.getBoundingClientRect();
+              const fy = ((ev.clientY - rect.top) / rect.height - P) / (1 - 2 * P);
+              const val = Math.round(clampE(10 - fy * 9) * 10) / 10;
+              setEnergyTarget((prev) => { const nx = [...prev]; nx[dragPoint] = val; return nx; });
+              setEnergyShape("custom");
+            };
+            const endDrag = () => { if (dragPoint != null) { setDragPoint(null); saveEnergyTarget(cr.id, energyTarget); } };
             return (
               <div style={{ marginBottom: 18 }}>
-                <div style={{ fontSize: 9, color: "#555", letterSpacing: 2, marginBottom: 6 }}>ENERGY ARC · warm-up → peak → cool-down</div>
-                <div style={{ display: "flex", alignItems: "flex-end", gap: 2, height: 44, background: "#0a0a18", borderRadius: 8, padding: "6px 8px", border: "1px solid #1e1e3a" }}>
-                  {arc.map((s, i) => {
-                    const e = Math.max(1, Math.min(10, s.energy || 5));
-                    return (
-                      <div key={s.id + "_e" + i} title={`${i + 1}. ${s.name} — energy ${e}/10`}
-                        style={{ flex: 1, height: `${e * 10}%`, minWidth: 2, background: v.color, opacity: 0.35 + e * 0.06, borderRadius: 2 }} />
-                    );
-                  })}
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8, flexWrap: "wrap", gap: 8 }}>
+                  <span style={{ fontSize: 9, color: "#666", letterSpacing: 2 }}>⚡ ENERGY MAP · drag the dots to shape your set</span>
+                  <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
+                    {Object.entries(ENERGY_SHAPES).map(([id, sh]) => (
+                      <button key={id} onClick={() => pickShape(cr.id, id)}
+                        style={{ ...F.ghost(energyShape === id ? v.color : "#444", true), padding: "4px 8px" }}>
+                        {sh.emoji} {sh.label}
+                      </button>
+                    ))}
+                    <button onClick={() => arrangeToEnergyMap(cr.id)} style={{ ...F.btn(v.color, true), padding: "4px 10px" }}>
+                      🎢 Arrange to shape
+                    </button>
+                  </div>
+                </div>
+                <div ref={energyRef} onPointerMove={onMove} onPointerUp={endDrag} onPointerLeave={endDrag}
+                  style={{ position: "relative", height: 120, background: "#0a0a18", borderRadius: 10, border: "1px solid #1e1e3a", touchAction: "none", overflow: "hidden" }}>
+                  <svg viewBox="0 0 100 100" preserveAspectRatio="none" style={{ position: "absolute", inset: 0, width: "100%", height: "100%" }}>
+                    {[2.5, 5, 7.5].map((g) => <line key={g} x1="0" x2="100" y1={y01(g) * 100} y2={y01(g) * 100} stroke="#1a1a30" strokeWidth="0.4" />)}
+                    <polygon points={`0,100 ${targetPts} 100,100`} fill={`${v.color}18`} />
+                    <polyline points={targetPts} fill="none" stroke={v.color} strokeWidth="1.2" vectorEffect="non-scaling-stroke" />
+                    <polyline points={actualPts} fill="none" stroke="#8a8ab0" strokeWidth="1" strokeDasharray="3 3" vectorEffect="non-scaling-stroke" />
+                  </svg>
+                  {energyTarget.map((val, i) => (
+                    <div key={i}
+                      onPointerDown={(e) => { e.preventDefault(); setDragPoint(i); }}
+                      title={`Target energy ${val.toFixed(1)}`}
+                      style={{
+                        position: "absolute", left: `${tx(i)}%`, top: `${y01(val) * 100}%`,
+                        width: dragPoint === i ? 16 : 13, height: dragPoint === i ? 16 : 13,
+                        marginLeft: -8, marginTop: -8, borderRadius: "50%",
+                        background: v.color, border: "2px solid #06060f", cursor: "grab",
+                        boxShadow: dragPoint === i ? `0 0 0 4px ${v.color}44` : "none", touchAction: "none",
+                      }} />
+                  ))}
+                  <span style={{ position: "absolute", left: 8, top: 6, fontSize: 8, color: "#444" }}>HIGH</span>
+                  <span style={{ position: "absolute", left: 8, bottom: 6, fontSize: 8, color: "#444" }}>LOW</span>
+                  <span style={{ position: "absolute", right: 8, bottom: 6, fontSize: 8, color: "#8a8ab0" }}>┄ actual energy</span>
                 </div>
               </div>
             );
@@ -1239,10 +1357,29 @@ export default function App() {
                   onChange={(e) => setBpmFilter({ min: filter.min, max: Math.max(+e.target.value, filter.min) })}
                   style={{ flex: 1 }} />
                 <span style={{ fontSize: 11, color: v.color, fontFamily: "'Barlow Condensed',sans-serif", fontWeight: 700, minWidth: 64, textAlign: "right" }}>{filter.min}–{filter.max}</span>
-                {filterActive && <button onClick={() => setBpmFilter(null)} style={F.ghost("#444", true)}>reset</button>}
+                {bpmActive && <button onClick={() => setBpmFilter(null)} style={F.ghost("#444", true)}>reset</button>}
               </div>
             )}
           </div>
+
+          {/* Mood filter chips */}
+          {availableMoods.length > 0 && (
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginBottom: 14 }}>
+              <span style={{ fontSize: 9, color: "#666", letterSpacing: 1, marginRight: 2 }}>MOOD</span>
+              {availableMoods.map((mo) => {
+                const on = moodFilter.includes(mo);
+                const c = MOOD_COLOR[mo];
+                return (
+                  <button key={mo}
+                    onClick={() => setMoodFilter((f) => on ? f.filter((x) => x !== mo) : [...f, mo])}
+                    style={{ ...F.ghost(on ? c : "#444", true), background: on ? `${c}22` : "transparent", padding: "3px 9px", textTransform: "capitalize" }}>
+                    {mo}
+                  </button>
+                );
+              })}
+              {moodFilter.length > 0 && <button onClick={() => setMoodFilter([])} style={F.ghost("#444", true)}>clear</button>}
+            </div>
+          )}
 
           {filterActive && (
             <div style={{ fontSize: 10, color: "#666", marginBottom: 10 }}>
@@ -1360,6 +1497,13 @@ export default function App() {
                               : <span style={{ ...F.tag("#666"), fontSize: 8, flexShrink: 0 }}>⌀ NO MATCH</span>)}
                           </div>
                           <div style={{ fontSize: 10, color: "#555" }}>{song.artists.map((a) => a.name).join(", ")}</div>
+                          {song.moods?.length > 0 && (
+                            <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginTop: 4 }}>
+                              {song.moods.map((mo) => (
+                                <span key={mo} style={{ ...F.tag(MOOD_COLOR[mo] || "#666"), fontSize: 8, padding: "1px 6px", textTransform: "capitalize" }}>{mo}</span>
+                              ))}
+                            </div>
+                          )}
                           {song.reason && <div style={{ fontSize: 9, color: "#444", marginTop: 3, fontStyle: "italic" }}>💡 {song.reason}</div>}
                         </div>
 
